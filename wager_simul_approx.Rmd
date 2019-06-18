@@ -1,0 +1,453 @@
+---
+title: "wager_simul_lambda with intercept"
+author: "Beyrem"
+date: "30 janvier 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+
+library(knitr)
+library(survival)
+library(glmnet)
+library(Matrix)
+library(ROCR)
+library(parallel)
+require(mvtnorm)
+
+#Rcpp::sourceCpp('~/cluster/Cfunctions.cpp')
+
+ Rcpp::sourceCpp('Cfunctions.cpp')
+
+
+knitr::opts_chunk$set(
+    dev = "png",
+    fig.width = 5,
+    fig.height = 5,
+    fig.align = "center",
+    cache = TRUE
+)
+options( width = 120 )
+set.seed(1234)
+  mc.cores <- 4
+
+```
+
+## R Markdown
+
+We want to reproduce exactly Wager simulation 
+
+
+```{r simulation, eval=FALSE}
+
+
+generate_data= function(n,d1,d2)
+  {  d= d1+d2
+    A=log(126)/2
+   xtrain=rmvnorm(n,rep(0,d1+d2))
+   xtrain[1:n,1:d1]=matrix(0,n,d1)
+   # generate data (see A.1 in Wager's paper)
+   for (k in 1:n) 
+ {
+  g= (k %% 25)+1 
+  sgn=sample(c(-1,1),1)
+  if (g<=5) 
+  {
+    C=runif(10,0,A)
+    xtrain[k,(10*(g-1)+1):(10*(g-1)+10)]= as.vector(sgn * exp(C))
+    }
+  xtrain[k,(d1+1):(d1+d2)]=rnorm(d2,0)
+  }
+return(xtrain)}
+  
+generate_label=function(xtrain,d1,d2,b)
+{
+  n=nrow(xtrain)
+  beta= c(rep(b,d1),rep(0,d2)) #linear combination of the first two features 
+  z = sapply(1:n, function(i) sum(beta * xtrain[i,])) # linear combination of the first two features 
+  pr = 1/(1+exp(-z))         # pass through an inv-logit function
+  y = rbinom(n,1,pr)      # NOISY bernoulli response variable
+
+  return(y) }
+
+  
+#generate 100 training sets with n=75 and 1050 features as in Wager's experiments
+
+dataset= list()
+dataset_label=list()
+
+for (i in 1:100) 
+ { dataset[[i]]=generate_data(75,50,1000)
+ dataset_label[[i]]=generate_label( dataset[[i]],50,1000,0.057)
+}
+
+  
+#generate test set with n=5000 and 1050 features.
+
+dataset_test= generate_data(5000,50,1000)
+ dataset_test_label=generate_label( dataset_test,50,1000,0.057)
+ 
+desact= which(sapply(1:5000,function(i) mean(dataset_test[i,1:50]))==rep(0,50))
+act=seq(5000)[-desact]
+
+
+seqlambda=c(0.0001,0.01,0.1,0.5,1,2,9,32,100,1000)
+
+```
+
+
+We save the data under "wager_simul.Rdata" that will be used along. 
+
+## Including Code
+
+
+The code from "auc_wager_simul_lambda.R" , evaluates the accuracy of the regularized linear models (regularized respectively by ridge glmnet with different lambdas, ridge sgd, dropout probability $p=\lambda / (1+\lambda)$ (corresponding to bernoulli probability 0.1) , multiplicative gaussian noise, Lasso and finally quadratic dropout (or determinisitic Taylor approximation of dropout loss.)
+Cutoff is 0 
+
+```{r code, eval=FALSE}
+
+library(glmnet)
+library(Matrix)
+library(ROCR)
+require(mvtnorm)
+
+
+
+
+load("wager_simul_lambda_0.Rdata")
+
+Rcpp::sourceCpp('functions.cpp')
+
+options(echo=FALSE ) # if you want see commands in output file
+args <- commandArgs(trailingOnly = TRUE)
+# Main loop (done in parallel on several cores)
+accuracy <- function(iexp,ind)
+{   xtrain=dataset[[iexp]]
+    d=ncol(xtrain)
+    n=nrow(xtrain)
+    y=dataset_label[[iexp]]
+    yy=dataset_test_label
+    xtest=dataset_test
+ 
+  auc <- matrix(nrow=1, ncol=24)
+  
+  # Ridge
+  m <- glmnet(xtrain,y , family="binomial" , lambda=seqlambda[ind] , intercept=T, alpha=0 ,standardize = F)
+ypred <- predict(m,xtest)
+ pred <- prediction(ypred[,1], yy)
+auc[1,1] <- performance(pred, "auc")@y.values[[1]]
+auc[1,2] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+ypred <- predict(m,xtest[act,])
+pred <- prediction(ypred[,1], yy[act])
+auc[1,3] <- performance(pred, "auc")@y.values[[1]]
+auc[1,4] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+
+
+  # SGD package ,rotation and scaling
+  # xtrain_rots= scale(xtrain_rot)
+  # for (ilambda in seq(nlambda)) {
+  #     m =sgd(xtrain_rots[itrain,],y[itrain],model="glm", model.control=c(binomial(link="logit"),lambda2=seqlambda[ilambda]),method="sgd",npasses=100000,start=m$beta[,ilambda])
+  #  ypred <- xtrain_rots[itest,] %*% m$coefficients
+  #  pred <- prediction(ypred,y[itest])
+  #  auc[ilambda, 5] <- performance(pred, "auc")@y.values[[1]]
+  # }
+  
+
+
+
+# SGD_ridge C batch
+
+m=sgd_logistic_batch_ridgeC(xtrain,y,rnorm(d,0,0.1),1,seqlambda[ind],100000,n)
+
+ypred <- xtest %*% m
+pred <- prediction(ypred[,1],yy)
+auc[1, 5] <- performance(pred, "auc")@y.values[[1]]
+auc[1, 6] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+ypred <- xtest[act,] %*% m
+pred <- prediction(ypred[,1], yy[act])
+auc[1,7] <- performance(pred, "auc")@y.values[[1]]
+auc[1,8] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+
+
+ # SGD_drop C batch
+  
+    m=sgd_logistic_batch_dropC(xtrain,y,rnorm(d,0,0.1),1,1/(1+seqlambda[ind]),100000,n)
+      
+      ypred <- xtest %*% m
+      pred <- prediction(ypred[,1],yy)
+      auc[1 , 9] <- performance(pred, "auc")@y.values[[1]]
+      auc[1 , 10] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+      
+      ypred <- xtest[act,] %*% m
+      pred <- prediction(ypred[,1], yy[act])
+      auc[1,11] <- performance(pred, "auc")@y.values[[1]]
+      auc[1,12] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+# SGD_mgauss C batch
+
+m=sgd_logistic_batch_mgaussC(xtrain,y,rnorm(d,0,0.1),1,seqlambda[ind],100000,n)
+
+ypred <- xtest  %*% m
+pred <- prediction(ypred[,1],yy)
+auc[1 , 13] <- performance(pred, "auc")@y.values[[1]]
+auc[1 , 14] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+ypred <- xtest[act,]  %*% m
+pred <- prediction(ypred[,1],yy[act])
+auc[1 , 15] <- performance(pred, "auc")@y.values[[1]]
+auc[1 , 16] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+  # Lasso
+  m <- glmnet(xtrain,y, family="binomial" , lambda= seqlambda[ind] /2  , intercept=T, alpha=1 , standardize=F)
+  ypred <- predict(m,xtest)
+  pred <- prediction(ypred[,1], yy)
+  auc[1, 17] <- performance(pred, "auc")@y.values[[1]]
+  auc[1, 18] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+ ypred <- predict(m,xtest[act,])
+ pred <- prediction(ypred[,1], yy[act])
+ auc[1, 19] <- performance(pred, "auc")@y.values[[1]]
+ auc[1, 20] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+ 
+
+
+
+# SGD_approxdrop C batch
+
+m=sgd_logistic_batch_approxdropC(xtrain,y,rnorm(d,0,0.1),1,seqlambda[ind],100000,n)
+
+ypred <- xtest  %*% m
+pred <- prediction(ypred[,1],yy)
+auc[1 , 21] <- performance(pred, "auc")@y.values[[1]]
+auc[1 , 22] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+ypred <- xtest[act,]  %*% m
+pred <- prediction(ypred[,1],yy[act])
+auc[1 , 23] <- performance(pred, "auc")@y.values[[1]]
+auc[1 , 24] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+ 
+    return(auc)
+}
+
+
+filename=paste("/cbio/donnees/bkhalfaoui/Results/acc100k_wager_simul_lambda_0int_aut",args[1],args[2],".Rdata",sep="")
+acc=accuracy(as.numeric(args[1]),as.numeric(args[2]))
+save(acc,file=filename)
+
+```
+
+
+
+## Including plots
+
+We first plot the accuracy mean values (in terms of AUC and missclassification respectively, for all instances and active instances respectively.), for the different regularizations (SGD, Lasso, batch SGD Ridge, batch SGD quad dropout, batch SGD dropout, batch Multiplicative Gaussian).
+Then we can look at the best fit and compare the boxplots of these methods for that particular value of lambda (which is 9 and corresponds to dropout probablity of 0.9 , and for ridge it's 32), we compare them on all and then on only the active examples (that is the examples where there is signal).
+
+```{r plots1,eval=FALSE}
+
+
+all_auc_tot=list()
+all_acc_tot=list()
+act_auc_tot=list()
+act_acc_tot=list()
+
+for (k in 1:100)
+{   all_auc=matrix(0,nrow=10,ncol=6)
+    act_auc=matrix(0,nrow=10,ncol=6)
+    all_acc=matrix(0,nrow=10,ncol=6)
+    act_acc=matrix(0,nrow=10,ncol=6)
+  for (j in 1:10)
+{filename=paste("/cbio/donnees/bkhalfaoui/Results/acc100k_wager_simul_lambda_0int_aut",as.character(k),as.character(j),".Rdata",sep="")
+    load(filename)
+    all_auc[j,]=acc[,c(1,5,9,13,17,21)]
+    act_auc[j,]=acc[,c(3,7,11,15,19,23)]
+    all_acc[j,]=acc[,c(2,6,10,14,18,22)]
+    act_acc[j,]=acc[,c(4,8,12,16,20,24)]}
+
+ all_auc_tot[[k]]= all_auc 
+ act_auc_tot[[k]]= act_auc 
+ all_acc_tot[[k]]= all_acc 
+ act_acc_tot[[k]]= act_acc 
+ 
+}
+
+
+auc_tot=list()
+for (j in 1:10)
+{   auc=matrix(0,nrow=100,ncol=24)
+  for (k in 1:100)
+{filename=paste("/cbio/donnees/bkhalfaoui/Results/acc100k_wager_simul_lambda_0int_aut",as.character(k),as.character(j),".Rdata",sep="")
+    load(filename)
+   auc[k,]=acc
+ }
+
+auc_tot[[j]]= auc 
+}
+
+save(auc_tot,all_auc_tot,act_auc_tot,all_acc_tot,act_acc_tot,file="all_auc_wager_lambda_0int_aut.Rdata")
+
+
+```
+
+
+```{r plots2,echo=F,eval=F}
+
+
+load("all_auc_wager_lambda_0int_aut.Rdata")
+seqlambda=c(0.0001,0.01,0.1,0.5,1,2,9,32,100,1000)
+
+
+mauc <- apply(array(unlist(act_acc_tot), dim = c(nrow(act_acc_tot[[1]]), ncol(act_acc_tot[[1]]), length(auc_tot))), c(1,2), mean)
+
+matplot( mauc, type="l", lty=1, lwd=2, main="Active_acc_100k_wager", ylab="accuracy",xlab="lambda index",col=seq(6),xaxt='n')
+axis(side=1,1:10,seqlambda)
+legend("bottomright", legend=c("Ridge","SGD_ridge","SGD_drop","SGD_mgauss","Lasso","SGD_quadDrop"), col=seq(6), lty=1, lwd=2)
+#grid()
+
+
+mauc <- apply(array(unlist(act_auc_tot), dim = c(nrow(act_auc_tot[[1]]), ncol(act_auc_tot[[1]]), length(auc_tot))), c(1,2), mean)
+
+matplot( mauc, type="l", lty=1, lwd=2, main="Active_auc_100k_wager", ylab="AUC",xlab="lambda index",col=seq(6),xaxt='n')
+axis(side=1,1:10,seqlambda)
+legend("bottomright", legend=c("Ridge","SGD_ridge","SGD_drop","SGD_mgauss","Lasso","SGD_quadDrop"), col=seq(6), lty=1, lwd=2)
+#grid()
+  
+
+
+mauc <- apply(array(unlist(all_acc_tot), dim = c(nrow(all_acc_tot[[1]]), ncol(all_acc_tot[[1]]), length(all_acc_tot))), c(1,2), mean,xaxt='n')
+
+matplot( mauc, type="l", lty=1, lwd=2, main="All_acc_100k_wager", ylab="accuracy",xlab="lambda index",col=seq(6))
+axis(side=1,1:10,seqlambda)
+legend("bottomright", legend=c("Ridge","SGD_ridge","SGD_drop","SGD_mgauss","Lasso","SGD_quadDrop"), col=seq(6), lty=1, lwd=2)
+#grid()
+
+mauc <- apply(array(unlist(all_auc_tot), dim = c(nrow(all_auc_tot[[1]]), ncol(all_auc_tot[[1]]), length(auc_tot))), c(1,2), mean)
+
+matplot( mauc, type="l", lty=1, lwd=2, main="All_auc_100k_wager", ylab="AUC",xlab="lambda index",col=seq(6),xaxt='n')
+axis(side=1,1:10,seqlambda)
+legend("bottomright", legend=c("Ridge","SGD_ridge","SGD_drop","SGD_mgauss","Lasso","SGD_quadDrop"), col=seq(6), lty=1, lwd=2)
+#grid()
+  
+
+# Wager's results   
+
+
+boxplot(cbind(auc_tot[[8]][,2],auc_tot[[8]][,6],auc_tot[[7]][,10],auc_tot[[7]][,14],auc_tot[[8]][,18],auc_tot[[7]][,22]), type="l", lty=1, lwd=1, main="Wager_100k_all_acc_lambda=9", ylab="AUC",xlab="lambda index",col=seq(6))
+legend("bottomright", legend=c("Ridge","SGD_C_ridge","SGD_drop","SGD_mgaussC","Lasso","SGD_quadDrop"), col=seq(6), lty=1, lwd=2)
+
+
+boxplot(cbind(auc_tot[[8]][,4],auc_tot[[8]][,8],auc_tot[[7]][,12],auc_tot[[7]][,16],auc_tot[[8]][,20],auc_tot[[7]][,24]), type="l", lty=1, lwd=1, main="Wager_100k_active_acc", ylab="acc",xlab="lambda index",col=seq(6))
+legend("bottomright", legend=c("Ridge","SGD_C_ridge","SGD_drop","SGD_mgaussC","Lasso","SGD_quadDrop"), col=seq(6), lty=1, lwd=2)
+
+
+ mean(auc_tot[[8]][,2])
+ mean(auc_tot[[8]][,4])
+ 
+```
+
+
+
+We now test our new approximation on the same simulation data and proccess the same taking the accuracy at lambda =32 and p=0.1 . The code for this approximation is in 'approxC.cpp'.
+
+```{r plots1_approx,eval=FALSE}
+
+m=droplasso_newappC(xtrain,y,family="binomial",1/(1+seqlambda[ind]),0,rnorm(d,0,0.1),1,1000,n)
+
+ypred <- xtest %*% (1/(1+seqlambda[ind])*m)
+pred <- prediction(ypred[,1],yy)
+auc[1, 1] <- performance(pred, "auc")@y.values[[1]]
+auc[1, 2] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+ypred <- xtest[act,] %*% (1/(1+seqlambda[ind])*m)
+pred <- prediction(ypred[,1], yy[act])
+auc[1,3] <- performance(pred, "auc")@y.values[[1]]
+auc[1,4] <- performance(pred, "acc")@y.values[[1]][max(which(performance(pred, "acc")@x.values[[1]] >= 0))]
+
+
+all_auc_tot=list()
+all_acc_tot=list()
+act_auc_tot=list()
+act_acc_tot=list()
+
+for (k in 1:100)
+{   all_auc=matrix(0,nrow=10,ncol=1)
+    act_auc=matrix(0,nrow=10,ncol=1)
+    all_acc=matrix(0,nrow=10,ncol=1)
+    act_acc=matrix(0,nrow=10,ncol=1)
+  for (j in 1:10)
+{filename=paste("/cbio/donnees/bkhalfaoui/Results/acc_wager_simul_newapp",as.character(k),as.character(j),".Rdata",sep="")
+    load(filename)
+    all_auc[j,]=acc[,c(1)]
+    act_auc[j,]=acc[,c(3)]
+    all_acc[j,]=acc[,c(2)]
+    act_acc[j,]=acc[,c(4)]}
+
+ all_auc_tot[[k]]= all_auc 
+ act_auc_tot[[k]]= act_auc 
+ all_acc_tot[[k]]= all_acc 
+ act_acc_tot[[k]]= act_acc 
+ 
+}
+
+
+auc_tot=list()
+for (j in 1:10)
+{   auc=matrix(0,nrow=100,ncol=4)
+  for (k in 1:100)
+{filename=paste("/cbio/donnees/bkhalfaoui/Results/acc_wager_simul_newapp",as.character(k),as.character(j),".Rdata",sep="")
+    load(filename)
+   auc[k,]=acc
+ }
+
+auc_tot[[j]]= auc 
+}
+
+save(auc_tot,all_auc_tot,act_auc_tot,all_acc_tot,act_acc_tot,file="all_auc_wager_simul_newapp.Rdata")
+
+
+```
+
+
+
+
+```{r plots2_approx}
+
+seqlambda=c(0.0001,0.01,0.1,0.5,1,2,9,32,100,1000)
+
+
+
+# Wager's results   
+
+load("all_auc_wager_simul_newapp.Rdata")
+auc_approx = auc_tot[[7]]
+
+load("all_auc_wager_lambda_0int_aut.Rdata")
+
+#ALL_ACC
+boxplot(cbind(auc_tot[[8]][,2],auc_tot[[7]][,10],auc_tot[[7]][,14],auc_tot[[7]][,22],auc_approx[,2]), type="l", lty=1, lwd=1, ylab="acc",xlab="lambda index",col=rainbow(5),xaxt='n')
+axis(side=1,1:5, c("Ridge","SGD_drop","SGD_mgauss","SGD_quadDrop","approx_drop"))
+
+
+#Ac_ACC
+boxplot(cbind(auc_tot[[8]][,4],auc_tot[[7]][,12],auc_tot[[7]][,16],auc_tot[[7]][,24],auc_approx[,4]), type="l", lty=1, lwd=1, ylab="auc",xlab="lambda index",col=rainbow(5),xaxt='n')
+axis(side=1,1:5, c("Ridge","SGD_drop","SGD_mgauss","SGD_quadDrop","approx_drop"))
+
+
+```
